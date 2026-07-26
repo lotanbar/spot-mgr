@@ -539,11 +539,31 @@ $picPanel.Anchor = "Top,Left,Right,Bottom"
 $picPanel.BackColor = [System.Drawing.Color]::Black
 $form.Controls.Add($picPanel)
 
-$picBox = New-Object System.Windows.Forms.PictureBox
-$picBox.Dock = "Fill"
-$picBox.SizeMode = "Zoom"
-$picBox.BackColor = [System.Drawing.Color]::Black
-$picPanel.Controls.Add($picBox)
+# Custom "cover" draw (crop-to-fill, no letterboxing) so the preview
+# mirrors exactly how Windows itself renders a Fill-style wallpaper,
+# instead of PictureBox's Zoom mode which pads with black bars.
+$script:currentImage = $null
+$picPanel.Add_Paint({
+    param($sender, $e)
+    if ($script:currentImage) {
+        $img = $script:currentImage
+        $panelW = $picPanel.ClientSize.Width
+        $panelH = $picPanel.ClientSize.Height
+        if ($panelW -gt 0 -and $panelH -gt 0) {
+            $scale = [Math]::Max($panelW / $img.Width, $panelH / $img.Height)
+            $destW = $img.Width * $scale
+            $destH = $img.Height * $scale
+            $destX = ($panelW - $destW) / 2
+            $destY = ($panelH - $destH) / 2
+            $e.Graphics.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+            $e.Graphics.DrawImage($img, $destX, $destY, $destW, $destH)
+        }
+    }
+    $borderPen = New-Object System.Drawing.Pen($clrAccent, 1)
+    $e.Graphics.DrawRectangle($borderPen, 0, 0, $picPanel.ClientSize.Width - 1, $picPanel.ClientSize.Height - 1)
+    $borderPen.Dispose()
+})
+$picPanel.Add_Resize({ $picPanel.Invalidate() })
 
 $btnPrev = New-FlatButton "< PREVIOUS" $clrPanel2
 $btnPrev.Location = New-Object System.Drawing.Point(20, 325)
@@ -655,8 +675,9 @@ function Refresh-ScheduleLabel {
 
 function Update-Image($path) {
     if ($path -and (Test-Path $path)) {
-        if ($picBox.Image) { $picBox.Image.Dispose() }
-        $picBox.Image = [System.Drawing.Image]::FromFile($path)
+        if ($script:currentImage) { $script:currentImage.Dispose() }
+        $script:currentImage = [System.Drawing.Image]::FromFile($path)
+        $picPanel.Invalidate()
         $state = Get-State
         $lblStatus.Text = "Image $($state.Index + 1) of $($state.Images.Count)"
     } else {
