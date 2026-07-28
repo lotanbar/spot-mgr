@@ -5,6 +5,14 @@ param(
     [switch]$OpenLearnMore
 )
 
+# Set to $true only for the seconds-capable debug build (see build.ps1).
+# Task Scheduler hard-rejects repetition intervals under 60 seconds, so when
+# this is on and the user picks a sub-minute interval, the app falls back to
+# an in-process timer instead of a real scheduled task. That timer only runs
+# while this app instance stays open - it is a session-only debugging aid,
+# not a replacement for the real auto-refresh mechanism.
+$Script:IsDebugBuild = $false
+
 # ============================================================
 # Spotlight Manager
 # Fixes Windows Spotlight / Desktop Spotlight getting stuck on
@@ -323,18 +331,81 @@ function Invoke-Diagnostics {
 # -----------------------------------------------------------------
 # Scheduled task management for interval-based auto refresh
 # -----------------------------------------------------------------
+function Format-Interval {
+    param([TimeSpan]$Interval)
+
+    $parts = @()
+    if ($Interval.Days -gt 0)    { $parts += "$($Interval.Days)d" }
+    if ($Interval.Hours -gt 0)   { $parts += "$($Interval.Hours)h" }
+    if ($Interval.Minutes -gt 0) { $parts += "$($Interval.Minutes)m" }
+    if ($Interval.Seconds -gt 0) { $parts += "$($Interval.Seconds)s" }
+    if ($parts.Count -eq 0) { return "0s" }
+    return ($parts -join " ")
+}
+
+# -----------------------------------------------------------------
+# Builds a self-contained refresh script (no dependency on this exe's
+# file path surviving) and returns it as a base64 -EncodedCommand
+# payload for powershell.exe. The functions are pulled from THIS
+# process's already-loaded definitions (not re-typed/duplicated), so
+# the standalone version can never drift out of sync with the real
+# Get-NewSpotlightImages/Set-DesktopWallpaper/Move-SpotlightImage logic.
+# -----------------------------------------------------------------
+function Get-SilentRefreshEncodedCommand {
+    $neededFunctions = @(
+        "Write-Log", "New-ImageEntry", "Get-State", "Save-State",
+        "Get-NewSpotlightImages", "Set-DesktopWallpaper", "Move-SpotlightImage"
+    )
+
+    $sb = New-Object System.Text.StringBuilder
+    [void]$sb.AppendLine('$ErrorActionPreference = "Stop"')
+    [void]$sb.AppendLine("`$AppDir   = '$AppDir'")
+    [void]$sb.AppendLine("`$CacheDir = '$CacheDir'")
+    [void]$sb.AppendLine("`$StatePath = '$StatePath'")
+    [void]$sb.AppendLine("`$LogPath  = '$LogPath'")
+    [void]$sb.AppendLine("`$ApiBase  = '$ApiBase'")
+    [void]$sb.AppendLine('New-Item -ItemType Directory -Path $CacheDir -Force -ErrorAction SilentlyContinue | Out-Null')
+    [void]$sb.AppendLine(@'
+if (-not ([System.Management.Automation.PSTypeName]'Native.Wallpaper').Type) {
+    Add-Type -Namespace Native -Name Wallpaper -MemberDefinition @"
+[DllImport("user32.dll", CharSet=CharSet.Auto)]
+public static extern int SystemParametersInfo(int uAction, int uParam, string lpvParam, int fuWinIni);
+"@
+}
+'@)
+
+    foreach ($name in $neededFunctions) {
+        $def = (Get-Command $name -CommandType Function).Definition
+        [void]$sb.AppendLine("function $name {$def}")
+    }
+    [void]$sb.AppendLine('Move-SpotlightImage -Direction "Next" | Out-Null')
+
+    $bytes = [System.Text.Encoding]::Unicode.GetBytes($sb.ToString())
+    return [Convert]::ToBase64String($bytes)
+}
+
+# Task Scheduler's repetition trigger rejects any interval under 60 seconds
+# (confirmed: registering with e.g. PT30S throws "value ... out of range"),
+# so anything faster than that cannot go through Register-ScheduledTask at all.
+#
+# The action runs powershell.exe (a core Windows component) with the whole
+# refresh logic passed as -EncodedCommand, instead of pointing at this exe's
+# file path. That means the schedule keeps working in Windows even after
+# this portable exe is deleted or moved - only %LOCALAPPDATA%\SpotlightManager
+# (cache + state, already there regardless) needs to remain.
 function Set-AutoRefreshSchedule {
-    param([int]$Minutes)
+    param([TimeSpan]$Interval)
 
     try {
-        $exePath = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+        $psExe = Join-Path $env:windir "System32\WindowsPowerShell\v1.0\powershell.exe"
+        $encoded = Get-SilentRefreshEncodedCommand
         Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
 
-        $action = New-ScheduledTaskAction -Execute $exePath -Argument "-Silent -Refresh"
-        $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes $Minutes) -RepetitionDuration (New-TimeSpan -Days 3650)
+        $action = New-ScheduledTaskAction -Execute $psExe -Argument "-NoProfile -WindowStyle Hidden -EncodedCommand $encoded"
+        $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval $Interval -RepetitionDuration (New-TimeSpan -Days 3650)
         $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
-        Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Settings $settings -Description "Rotates the desktop Spotlight image on an interval." | Out-Null
-        Write-Log "Auto-refresh scheduled every $Minutes minute(s)."
+        Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Settings $settings -Description "Rotates the desktop Spotlight image on an interval. Self-contained - does not depend on SpotlightManager.exe still existing." | Out-Null
+        Write-Log "Auto-refresh scheduled every $(Format-Interval $Interval) (self-contained, exe not required to persist)."
         return $true
     } catch {
         Write-Log "Failed to create scheduled task: $($_.Exception.Message)"
@@ -364,6 +435,36 @@ function Get-AutoRefreshSchedule {
         # not a TimeSpan object, so it needs explicit parsing.
         return [System.Xml.XmlConvert]::ToTimeSpan($intervalStr)
     } catch { return $null }
+}
+
+# -----------------------------------------------------------------
+# Debug-only in-process fallback for sub-minute intervals (see
+# $Script:IsDebugBuild above). Ticks for as long as this app instance
+# stays open; closing the app or logging off stops it - unlike the real
+# scheduled task, it is not persistent.
+# -----------------------------------------------------------------
+$script:DebugTimer = $null
+$script:DebugTimerInterval = $null
+
+function Start-DebugInProcessTimer {
+    param([TimeSpan]$Interval, [scriptblock]$OnTick)
+
+    Stop-DebugInProcessTimer
+    $script:DebugTimer = New-Object System.Windows.Forms.Timer
+    $script:DebugTimer.Interval = [Math]::Max(1, [int]$Interval.TotalMilliseconds)
+    $script:DebugTimer.Add_Tick($OnTick)
+    $script:DebugTimer.Start()
+    $script:DebugTimerInterval = $Interval
+    Write-Log "Debug in-process timer started, every $(Format-Interval $Interval) (session-only, stops when the app closes)."
+}
+
+function Stop-DebugInProcessTimer {
+    if ($script:DebugTimer) {
+        $script:DebugTimer.Stop()
+        $script:DebugTimer.Dispose()
+        $script:DebugTimer = $null
+        $script:DebugTimerInterval = $null
+    }
 }
 
 # -----------------------------------------------------------------
@@ -501,8 +602,8 @@ Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
 $form = New-Object System.Windows.Forms.Form
-$form.Text = "Spotlight Manager"
-$form.Size = New-Object System.Drawing.Size(560, 550)
+$form.Text = if ($Script:IsDebugBuild) { "Spotlight Manager (DEBUG)" } else { "Spotlight Manager" }
+$form.Size = New-Object System.Drawing.Size(560, 580)
 $form.StartPosition = "CenterScreen"
 $form.FormBorderStyle = "FixedDialog"
 $form.MaximizeBox = $false
@@ -549,57 +650,77 @@ $form.Controls.Add($btnNext)
 $groupBox = New-Object System.Windows.Forms.GroupBox
 $groupBox.Text = "Auto-refresh interval"
 $groupBox.Location = New-Object System.Drawing.Point(15, 285)
-$groupBox.Size = New-Object System.Drawing.Size(530, 60)
+$groupBox.Size = New-Object System.Drawing.Size(530, 90)
 $form.Controls.Add($groupBox)
 
-$numInterval = New-Object System.Windows.Forms.NumericUpDown
-$numInterval.Location = New-Object System.Drawing.Point(15, 25)
-$numInterval.Size = New-Object System.Drawing.Size(70, 25)
-$numInterval.Minimum = 1
-$numInterval.Maximum = 999
-$numInterval.Value = 1
-$groupBox.Controls.Add($numInterval)
+# Days / Hours / Minutes (/ Seconds, debug build only) fields, each with a
+# unit label above it, combined into one TimeSpan when the schedule is set.
+$unitFieldWidth = 60
+$unitSpacing    = 70
+$unitX          = 15
 
-$cmbUnit = New-Object System.Windows.Forms.ComboBox
-$cmbUnit.Location = New-Object System.Drawing.Point(95, 25)
-$cmbUnit.Size = New-Object System.Drawing.Size(100, 25)
-$cmbUnit.DropDownStyle = "DropDownList"
-$cmbUnit.Items.AddRange(@("Minutes", "Hours", "Days"))
-$cmbUnit.SelectedIndex = 1
-$groupBox.Controls.Add($cmbUnit)
+function New-IntervalUnitField {
+    param([string]$LabelText, [int]$X, [int]$Max)
+
+    $lbl = New-Object System.Windows.Forms.Label
+    $lbl.Text = $LabelText
+    $lbl.Location = New-Object System.Drawing.Point($X, 20)
+    $lbl.Size = New-Object System.Drawing.Size($unitFieldWidth, 16)
+    $groupBox.Controls.Add($lbl)
+
+    $num = New-Object System.Windows.Forms.NumericUpDown
+    $num.Location = New-Object System.Drawing.Point($X, 38)
+    $num.Size = New-Object System.Drawing.Size($unitFieldWidth, 25)
+    $num.Minimum = 0
+    $num.Maximum = $Max
+    $num.Value = 0
+    $groupBox.Controls.Add($num)
+    return $num
+}
+
+$numDays    = New-IntervalUnitField -LabelText "Days"    -X ($unitX)                     -Max 3650
+$numHours   = New-IntervalUnitField -LabelText "Hours"   -X ($unitX + $unitSpacing)       -Max 23
+$numMinutes = New-IntervalUnitField -LabelText "Minutes" -X ($unitX + $unitSpacing * 2)   -Max 59
+$numMinutes.Value = 1
+
+$buttonsX = $unitX + $unitSpacing * 3
+if ($Script:IsDebugBuild) {
+    $numSeconds = New-IntervalUnitField -LabelText "Seconds (debug)" -X ($unitX + $unitSpacing * 3) -Max 59
+    $buttonsX = $unitX + $unitSpacing * 4
+}
 
 $btnEnable = New-Object System.Windows.Forms.Button
 $btnEnable.Text = "Enable"
-$btnEnable.Location = New-Object System.Drawing.Point(210, 23)
+$btnEnable.Location = New-Object System.Drawing.Point($buttonsX, 38)
 $btnEnable.Size = New-Object System.Drawing.Size(90, 28)
 $groupBox.Controls.Add($btnEnable)
 
 $btnDisable = New-Object System.Windows.Forms.Button
 $btnDisable.Text = "Disable"
-$btnDisable.Location = New-Object System.Drawing.Point(310, 23)
+$btnDisable.Location = New-Object System.Drawing.Point(($buttonsX + 95), 38)
 $btnDisable.Size = New-Object System.Drawing.Size(90, 28)
 $groupBox.Controls.Add($btnDisable)
 
 $lblSchedule = New-Object System.Windows.Forms.Label
-$lblSchedule.Location = New-Object System.Drawing.Point(410, 28)
-$lblSchedule.Size = New-Object System.Drawing.Size(115, 20)
+$lblSchedule.Location = New-Object System.Drawing.Point($unitX, 68)
+$lblSchedule.Size = New-Object System.Drawing.Size(495, 18)
 $lblSchedule.Font = New-Object System.Drawing.Font($lblSchedule.Font, [System.Drawing.FontStyle]::Italic)
 $groupBox.Controls.Add($lblSchedule)
 
 $chkShortcut = New-Object System.Windows.Forms.CheckBox
 $chkShortcut.Text = "Show 'Learn More' icon on desktop"
-$chkShortcut.Location = New-Object System.Drawing.Point(15, 355)
+$chkShortcut.Location = New-Object System.Drawing.Point(15, 385)
 $chkShortcut.Size = New-Object System.Drawing.Size(530, 24)
 $form.Controls.Add($chkShortcut)
 
 $btnDiag = New-Object System.Windows.Forms.Button
 $btnDiag.Text = "Run Diagnostics && Fix"
-$btnDiag.Location = New-Object System.Drawing.Point(15, 385)
+$btnDiag.Location = New-Object System.Drawing.Point(15, 415)
 $btnDiag.Size = New-Object System.Drawing.Size(530, 30)
 $form.Controls.Add($btnDiag)
 
 $txtLog = New-Object System.Windows.Forms.TextBox
-$txtLog.Location = New-Object System.Drawing.Point(15, 425)
+$txtLog.Location = New-Object System.Drawing.Point(15, 455)
 $txtLog.Size = New-Object System.Drawing.Size(530, 80)
 $txtLog.Multiline = $true
 $txtLog.ScrollBars = "Vertical"
@@ -612,9 +733,13 @@ function Append-Log($msg) {
 }
 
 function Refresh-ScheduleLabel {
+    if ($script:DebugTimer) {
+        $lblSchedule.Text = "DEBUG in-process timer active: every $(Format-Interval $script:DebugTimerInterval) (session-only)"
+        return
+    }
     $interval = Get-AutoRefreshSchedule
     if ($interval) {
-        $lblSchedule.Text = "Active: every $([int]$interval.TotalMinutes) min"
+        $lblSchedule.Text = "Active: every $(Format-Interval $interval)"
     } else {
         $lblSchedule.Text = "Not scheduled"
     }
@@ -692,20 +817,38 @@ $btnDiag.Add_Click({
 })
 
 $btnEnable.Add_Click({
-    $minutes = switch ($cmbUnit.SelectedItem) {
-        "Minutes" { [int]$numInterval.Value }
-        "Hours"   { [int]$numInterval.Value * 60 }
-        "Days"    { [int]$numInterval.Value * 60 * 24 }
+    $seconds = 0
+    if ($Script:IsDebugBuild) { $seconds = [int]$numSeconds.Value }
+    $interval = New-TimeSpan -Days ([int]$numDays.Value) -Hours ([int]$numHours.Value) -Minutes ([int]$numMinutes.Value) -Seconds $seconds
+
+    if ($interval.TotalSeconds -le 0) {
+        Append-Log "Enter an interval greater than zero."
+        return
     }
-    if (Set-AutoRefreshSchedule -Minutes $minutes) {
-        Append-Log "Auto-refresh enabled: every $($numInterval.Value) $($cmbUnit.SelectedItem)."
+
+    if ($Script:IsDebugBuild -and $interval.TotalSeconds -lt 60) {
+        # Task Scheduler cannot repeat faster than once a minute, so this
+        # debug-only path drives the rotation directly from the running
+        # process instead - see Start-DebugInProcessTimer above.
+        Remove-AutoRefreshSchedule | Out-Null
+        Start-DebugInProcessTimer -Interval $interval -OnTick {
+            $entry = Move-SpotlightImage -Direction "Next"
+            Update-Image $entry
+        }
+        Append-Log "DEBUG: using in-process timer every $(Format-Interval $interval) (under Task Scheduler's 60s floor - session-only)."
     } else {
-        Append-Log "Failed to enable auto-refresh. Check log.txt for details."
+        Stop-DebugInProcessTimer
+        if (Set-AutoRefreshSchedule -Interval $interval) {
+            Append-Log "Auto-refresh enabled: every $(Format-Interval $interval)."
+        } else {
+            Append-Log "Failed to enable auto-refresh. Check log.txt for details."
+        }
     }
     Refresh-ScheduleLabel
 })
 
 $btnDisable.Add_Click({
+    Stop-DebugInProcessTimer
     Remove-AutoRefreshSchedule | Out-Null
     Append-Log "Auto-refresh disabled."
     Refresh-ScheduleLabel
@@ -740,6 +883,8 @@ $form.Add_Shown({
     $chkShortcut.Checked = Test-LearnMoreShortcutExists
     $script:InitializingShortcutCheckbox = $false
 })
+
+$form.Add_FormClosing({ Stop-DebugInProcessTimer })
 
 [System.Windows.Forms.Application]::EnableVisualStyles()
 [System.Windows.Forms.Application]::Run($form)
