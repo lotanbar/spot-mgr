@@ -676,6 +676,19 @@ $lblInfo.Padding = New-Object System.Windows.Forms.Padding(10, 0, 10, 0)
 $lblInfo.AutoEllipsis = $true
 $picPanel.Controls.Add($lblInfo)
 
+# Clicking the image itself does the same thing as the Learn More button -
+# $lblInfo is a child control sitting on top of the image, so it needs its
+# own handler too (a click on a child doesn't bubble up to the parent's).
+$openLearnMoreForCurrentImage = {
+    if ($script:CurrentLearnMoreUrl) {
+        Open-LearnMoreLink -Url $script:CurrentLearnMoreUrl
+    }
+}
+$picPanel.Cursor = "Hand"
+$picPanel.Add_Click($openLearnMoreForCurrentImage)
+$lblInfo.Cursor = "Hand"
+$lblInfo.Add_Click($openLearnMoreForCurrentImage)
+
 $btnPrev = New-FlatButton "< PREVIOUS" $clrPanel2
 $btnPrev.Location = New-Object System.Drawing.Point(20, 335)
 $btnPrev.Size = New-Object System.Drawing.Size(100, 34)
@@ -853,11 +866,7 @@ $btnNext.Add_Click({
     }
 })
 
-$btnLearnMore.Add_Click({
-    if ($script:CurrentLearnMoreUrl) {
-        Open-LearnMoreLink -Url $script:CurrentLearnMoreUrl
-    }
-})
+$btnLearnMore.Add_Click($openLearnMoreForCurrentImage)
 
 $btnPrev.Add_Click({
     $btnPrev.Enabled = $false; $btnNext.Enabled = $false
