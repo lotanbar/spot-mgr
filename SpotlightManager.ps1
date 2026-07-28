@@ -1,7 +1,8 @@
 param(
     [switch]$Silent,
     [switch]$Refresh,
-    [switch]$ElevatedFix
+    [switch]$ElevatedFix,
+    [switch]$OpenLearnMore
 )
 
 # ============================================================
@@ -29,6 +30,50 @@ function Write-Log {
     try { Add-Content -Path $LogPath -Value $line -ErrorAction SilentlyContinue } catch {}
 }
 
+function Find-ChromeExecutable {
+    # Checks the registered App Paths first (works regardless of install
+    # location/user vs machine install), then falls back to the common
+    # install folders, since different machines may have Chrome in
+    # different places or not installed at all.
+    foreach ($regPath in @(
+        "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe",
+        "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe"
+    )) {
+        try {
+            $p = (Get-ItemProperty -Path $regPath -ErrorAction SilentlyContinue).'(default)'
+            if ($p -and (Test-Path $p)) { return $p }
+        } catch {}
+    }
+    foreach ($candidate in @(
+        "$env:ProgramFiles\Google\Chrome\Application\chrome.exe",
+        "${env:ProgramFiles(x86)}\Google\Chrome\Application\chrome.exe",
+        "$env:LOCALAPPDATA\Google\Chrome\Application\chrome.exe"
+    )) {
+        if (Test-Path $candidate) { return $candidate }
+    }
+    return $null
+}
+
+function Open-LearnMoreLink {
+    param([string]$Url)
+    if (-not $Url) { return }
+    # Defensive strip in case an older cached entry still has the
+    # microsoft-edge: deep-link scheme from a previous version.
+    $cleanUrl = $Url -replace '^microsoft-edge:', ''
+    try {
+        $chrome = Find-ChromeExecutable
+        if ($chrome) {
+            Start-Process -FilePath $chrome -ArgumentList $cleanUrl
+            Write-Log "Opened Learn More link in Chrome: $cleanUrl"
+        } else {
+            Write-Log "Chrome not found on this machine, opening Learn More link in the default browser instead."
+            Start-Process $cleanUrl
+        }
+    } catch {
+        Write-Log "Failed to open Learn More link: $($_.Exception.Message)"
+    }
+}
+
 function Test-IsAdmin {
     $id = [Security.Principal.WindowsIdentity]::GetCurrent()
     $p = New-Object Security.Principal.WindowsPrincipal($id)
@@ -53,12 +98,32 @@ function Test-InternetConnection {
 # -----------------------------------------------------------------
 # State (list of cached image paths + current index)
 # -----------------------------------------------------------------
+function New-ImageEntry {
+    param($Path, $Title = $null, $Description = $null, $Copyright = $null, $LearnMoreUrl = $null)
+    return [PSCustomObject]@{
+        Path         = $Path
+        Title        = $Title
+        Description  = $Description
+        Copyright    = $Copyright
+        LearnMoreUrl = $LearnMoreUrl
+    }
+}
+
 function Get-State {
     if (Test-Path $StatePath) {
         try {
             $s = Get-Content $StatePath -Raw | ConvertFrom-Json
+            $images = @()
+            foreach ($item in @($s.Images)) {
+                if ($item -is [string]) {
+                    # Migrate from the older state format (plain path strings, no metadata).
+                    $images += New-ImageEntry -Path $item
+                } else {
+                    $images += New-ImageEntry -Path $item.Path -Title $item.Title -Description $item.Description -Copyright $item.Copyright -LearnMoreUrl $item.LearnMoreUrl
+                }
+            }
             return [PSCustomObject]@{
-                Images = @($s.Images)
+                Images = $images
                 Index  = [int]$s.Index
             }
         } catch {
@@ -96,7 +161,8 @@ function Get-NewSpotlightImages {
         foreach ($it in $items) {
             try {
                 $parsed = $it.item | ConvertFrom-Json
-                $url = $parsed.ad.landscapeImage.asset
+                $ad = $parsed.ad
+                $url = $ad.landscapeImage.asset
                 if (-not $url) { continue }
 
                 $md5 = [System.Security.Cryptography.MD5]::Create()
@@ -108,7 +174,11 @@ function Get-NewSpotlightImages {
                     Invoke-WebRequest -Uri $url -OutFile $dest -TimeoutSec 30
                     Write-Log "Downloaded new image: $hash.jpg"
                 }
-                $downloaded += $dest
+
+                # ctaUri is a "microsoft-edge:https://www.bing.com/spotlight?..." deep link -
+                # the microsoft-edge: scheme is stripped since we open it in Chrome instead.
+                $learnMoreUrl = $ad.ctaUri -replace '^microsoft-edge:', ''
+                $downloaded += New-ImageEntry -Path $dest -Title $ad.title -Description $ad.description -Copyright $ad.copyright -LearnMoreUrl $learnMoreUrl
             } catch {
                 Write-Log "Failed to download one image: $($_.Exception.Message)"
             }
@@ -128,138 +198,6 @@ if (-not ([System.Management.Automation.PSTypeName]'Native.Wallpaper').Type) {
 [DllImport("user32.dll", CharSet=CharSet.Auto)]
 public static extern int SystemParametersInfo(int uAction, int uParam, string lpvParam, int fuWinIni);
 "@
-}
-
-if (-not ([System.Management.Automation.PSTypeName]'Native.Chiptune').Type) {
-    # Synthesizes an original multi-voice square-wave "scene intro" style
-    # stinger (bass pulses + arpeggio + closing chord stab) and writes it
-    # to a real WAV file, played through the actual sound device via
-    # System.Media.SoundPlayer. Every sample is generated math, not a
-    # sourced/ripped recording, so there is zero copyright exposure -
-    # nothing is downloaded from YouTube or anywhere else.
-    Add-Type -Namespace Native -Name Chiptune -MemberDefinition @"
-public static void GenerateWav(string path)
-{
-    int sampleRate = 44100;
-    double duration = 2.6;
-    int totalSamples = (int)(sampleRate * duration);
-    short[] samples = new short[totalSamples];
-
-    double[,] lead = new double[,] {
-        {0.00,392},{0.10,494},{0.20,587},{0.30,784},
-        {0.45,587},{0.55,784},{0.65,988},{0.80,1175},
-        {1.00,988},{1.10,1175},{1.20,1568}
-    };
-    double leadNoteLen = 0.09;
-
-    double[] bassTimes = { 0.0, 0.3, 0.6, 0.9, 1.2 };
-    double bassFreq = 98.0;
-    double bassNoteLen = 0.28;
-
-    double stabStart = 1.5;
-    double stabLen = duration - stabStart;
-    double[] stabFreqs = { 196, 294, 392, 494 };
-
-    for (int i = 0; i < totalSamples; i++)
-    {
-        double t = (double)i / sampleRate;
-        double val = 0;
-
-        for (int n = 0; n < lead.GetLength(0); n++)
-        {
-            double start = lead[n, 0];
-            double freq = lead[n, 1];
-            if (t >= start && t < start + leadNoteLen)
-            {
-                double lt = t - start;
-                double env = System.Math.Exp(-lt * 14);
-                double sq = System.Math.Sign(System.Math.Sin(2 * System.Math.PI * freq * lt));
-                val += sq * env * 0.22;
-            }
-        }
-
-        for (int b = 0; b < bassTimes.Length; b++)
-        {
-            double bstart = bassTimes[b];
-            if (t >= bstart && t < bstart + bassNoteLen)
-            {
-                double lt = t - bstart;
-                double env = System.Math.Exp(-lt * 5);
-                double sq = System.Math.Sign(System.Math.Sin(2 * System.Math.PI * bassFreq * lt));
-                val += sq * env * 0.28;
-            }
-        }
-
-        if (t >= stabStart && t < stabStart + stabLen)
-        {
-            double lt = t - stabStart;
-            double env = System.Math.Exp(-lt * 2.2);
-            double chord = 0;
-            for (int f = 0; f < stabFreqs.Length; f++)
-            {
-                chord += System.Math.Sign(System.Math.Sin(2 * System.Math.PI * stabFreqs[f] * lt));
-            }
-            chord /= stabFreqs.Length;
-            val += chord * env * 0.35;
-        }
-
-        if (val > 1) val = 1;
-        if (val < -1) val = -1;
-        samples[i] = (short)(val * short.MaxValue * 0.9);
-    }
-
-    using (System.IO.FileStream fs = new System.IO.FileStream(path, System.IO.FileMode.Create))
-    using (System.IO.BinaryWriter bw = new System.IO.BinaryWriter(fs))
-    {
-        int byteRate = sampleRate * 2;
-        int dataSize = samples.Length * 2;
-        bw.Write(System.Text.Encoding.ASCII.GetBytes("RIFF"));
-        bw.Write(36 + dataSize);
-        bw.Write(System.Text.Encoding.ASCII.GetBytes("WAVE"));
-        bw.Write(System.Text.Encoding.ASCII.GetBytes("fmt "));
-        bw.Write(16);
-        bw.Write((short)1);
-        bw.Write((short)1);
-        bw.Write(sampleRate);
-        bw.Write(byteRate);
-        bw.Write((short)2);
-        bw.Write((short)16);
-        bw.Write(System.Text.Encoding.ASCII.GetBytes("data"));
-        bw.Write(dataSize);
-        for (int i = 0; i < samples.Length; i++) bw.Write(samples[i]);
-    }
-}
-
-public static void PlayIntroJingleAsync()
-{
-    try
-    {
-        string dir = System.IO.Path.Combine(
-            System.Environment.GetFolderPath(System.Environment.SpecialFolder.LocalApplicationData),
-            "SpotlightManager");
-        System.IO.Directory.CreateDirectory(dir);
-        string wavPath = System.IO.Path.Combine(dir, "intro.wav");
-        if (!System.IO.File.Exists(wavPath))
-        {
-            GenerateWav(wavPath);
-        }
-        System.Media.SoundPlayer player = new System.Media.SoundPlayer(wavPath);
-        player.Play();
-    }
-    catch { }
-}
-"@
-}
-
-# -----------------------------------------------------------------
-# Startup jingle - see Native.Chiptune above for how it is generated.
-# -----------------------------------------------------------------
-function Start-IntroJingle {
-    try {
-        [Native.Chiptune]::PlayIntroJingleAsync()
-    } catch {
-        Write-Log "Intro jingle failed to play: $($_.Exception.Message)"
-    }
 }
 
 function Set-DesktopWallpaper {
@@ -393,7 +331,7 @@ function Set-AutoRefreshSchedule {
         Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
 
         $action = New-ScheduledTaskAction -Execute $exePath -Argument "-Silent -Refresh"
-        $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes $Minutes) -RepetitionDuration ([TimeSpan]::MaxValue)
+        $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Minutes $Minutes) -RepetitionDuration (New-TimeSpan -Days 3650)
         $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
         Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Settings $settings -Description "Rotates the desktop Spotlight image on an interval." | Out-Null
         Write-Log "Auto-refresh scheduled every $Minutes minute(s)."
@@ -420,8 +358,56 @@ function Get-AutoRefreshSchedule {
         $t = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
         if (-not $t) { return $null }
         $trig = $t.Triggers | Select-Object -First 1
-        return $trig.Repetition.Interval
+        $intervalStr = $trig.Repetition.Interval
+        if (-not $intervalStr) { return $null }
+        # Repetition.Interval comes back as an ISO-8601 duration string (e.g. "PT1H"),
+        # not a TimeSpan object, so it needs explicit parsing.
+        return [System.Xml.XmlConvert]::ToTimeSpan($intervalStr)
     } catch { return $null }
+}
+
+# -----------------------------------------------------------------
+# Real desktop icon (a plain .lnk shortcut, not a floating window)
+# that opens the current image's info page when double-clicked.
+# -----------------------------------------------------------------
+function Get-LearnMoreShortcutPath {
+    return "$([Environment]::GetFolderPath('Desktop'))\Spotlight - Learn More.lnk"
+}
+
+function Test-LearnMoreShortcutExists {
+    return Test-Path (Get-LearnMoreShortcutPath)
+}
+
+function New-LearnMoreShortcut {
+    try {
+        $exePath = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+        $shortcutPath = Get-LearnMoreShortcutPath
+        $shell = New-Object -ComObject WScript.Shell
+        $shortcut = $shell.CreateShortcut($shortcutPath)
+        $shortcut.TargetPath = $exePath
+        $shortcut.Arguments = "-OpenLearnMore"
+        $shortcut.IconLocation = "$exePath,0"
+        $shortcut.Description = "Opens info about the current Spotlight desktop image"
+        $shortcut.WorkingDirectory = Split-Path $exePath -Parent
+        $shortcut.Save()
+        [Runtime.InteropServices.Marshal]::ReleaseComObject($shell) | Out-Null
+        Write-Log "Created desktop shortcut icon at $shortcutPath"
+        return $true
+    } catch {
+        Write-Log "Failed to create desktop shortcut icon: $($_.Exception.Message)"
+        return $false
+    }
+}
+
+function Remove-LearnMoreShortcut {
+    try {
+        Remove-Item -Path (Get-LearnMoreShortcutPath) -Force -ErrorAction SilentlyContinue
+        Write-Log "Removed desktop shortcut icon."
+        return $true
+    } catch {
+        Write-Log "Failed to remove desktop shortcut icon: $($_.Exception.Message)"
+        return $false
+    }
 }
 
 # -----------------------------------------------------------------
@@ -436,8 +422,9 @@ function Move-SpotlightImage {
         if ($state.Index -ge ($state.Images.Count - 1)) {
             $new = Get-NewSpotlightImages -Count 4
             $existing = @($state.Images)
-            foreach ($p in $new) {
-                if ($existing -notcontains $p) { $existing += $p }
+            $existingPaths = @($existing | ForEach-Object { $_.Path })
+            foreach ($item in $new) {
+                if ($existingPaths -notcontains $item.Path) { $existing += $item }
             }
             $state.Images = $existing
         }
@@ -454,18 +441,18 @@ function Move-SpotlightImage {
         $state.Index = [Math]::Max($state.Index - 1, 0)
     }
 
-    $path = $state.Images[$state.Index]
-    if (-not (Test-Path $path)) {
-        Write-Log "Cached image missing on disk, removing from list: $path"
-        $state.Images = @($state.Images | Where-Object { $_ -ne $path })
+    $entry = $state.Images[$state.Index]
+    if (-not (Test-Path $entry.Path)) {
+        Write-Log "Cached image missing on disk, removing from list: $($entry.Path)"
+        $state.Images = @($state.Images | Where-Object { $_.Path -ne $entry.Path })
         if ($state.Index -ge $state.Images.Count) { $state.Index = $state.Images.Count - 1 }
         Save-State $state
         return $null
     }
 
-    Set-DesktopWallpaper -Path $path | Out-Null
+    Set-DesktopWallpaper -Path $entry.Path | Out-Null
     Save-State $state
-    return $path
+    return $entry
 }
 
 # ============================================================
@@ -481,182 +468,142 @@ if ($Silent -and $Refresh) {
 }
 
 # ============================================================
-# GUI - dark theme
+# OpenLearnMore mode - invoked by the desktop shortcut icon.
+# Reads whatever image is currently active and opens its info page
+# in Chrome, then exits immediately. No window, no background process.
+# ============================================================
+if ($OpenLearnMore) {
+    Add-Type -AssemblyName System.Windows.Forms
+    try {
+        $state = Get-State
+        if ($state.Images.Count -gt 0 -and $state.Index -ge 0) {
+            $entry = $state.Images[$state.Index]
+            if ($entry.LearnMoreUrl) {
+                Open-LearnMoreLink -Url $entry.LearnMoreUrl
+            } else {
+                Write-Log "Desktop shortcut clicked, but the current image has no info link."
+                [System.Windows.Forms.MessageBox]::Show("No info available for the current image.", "Spotlight Manager") | Out-Null
+            }
+        } else {
+            Write-Log "Desktop shortcut clicked, but no image is cached yet."
+            [System.Windows.Forms.MessageBox]::Show("No image has been set yet. Open Spotlight Manager and click 'Next' first.", "Spotlight Manager") | Out-Null
+        }
+    } catch {
+        Write-Log "OpenLearnMore failed: $($_.Exception.Message)"
+    }
+    exit 0
+}
+
+# ============================================================
+# GUI
 # ============================================================
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
-$clrBg      = [System.Drawing.Color]::FromArgb(255, 18, 18, 22)
-$clrPanel   = [System.Drawing.Color]::FromArgb(255, 30, 30, 36)
-$clrPanel2  = [System.Drawing.Color]::FromArgb(255, 40, 40, 48)
-$clrAccent  = [System.Drawing.Color]::FromArgb(255, 130, 90, 255)
-$clrAccent2 = [System.Drawing.Color]::FromArgb(255, 100, 65, 220)
-$clrText    = [System.Drawing.Color]::FromArgb(255, 235, 235, 240)
-$clrMuted   = [System.Drawing.Color]::FromArgb(255, 150, 150, 160)
-$fontMain   = New-Object System.Drawing.Font("Segoe UI", 9.5)
-$fontBold   = New-Object System.Drawing.Font("Segoe UI Semibold", 10)
-$fontTitle  = New-Object System.Drawing.Font("Segoe UI Semibold", 13)
-
-function New-FlatButton {
-    param([string]$Text, [System.Drawing.Color]$Back, [System.Drawing.Color]$Fore = $clrText)
-    $b = New-Object System.Windows.Forms.Button
-    $b.Text = $Text
-    $b.FlatStyle = "Flat"
-    $b.FlatAppearance.BorderSize = 0
-    $b.BackColor = $Back
-    $b.ForeColor = $Fore
-    $b.Font = $fontBold
-    $b.Cursor = "Hand"
-    return $b
-}
-
 $form = New-Object System.Windows.Forms.Form
 $form.Text = "Spotlight Manager"
-$form.Size = New-Object System.Drawing.Size(600, 610)
-$form.MinimumSize = New-Object System.Drawing.Size(600, 610)
+$form.Size = New-Object System.Drawing.Size(560, 550)
 $form.StartPosition = "CenterScreen"
-$form.FormBorderStyle = "Sizable"
-$form.MaximizeBox = $true
-$form.MinimizeBox = $true
-$form.BackColor = $clrBg
-$form.ForeColor = $clrText
-$form.Font = $fontMain
-$form.KeyPreview = $true
+$form.FormBorderStyle = "FixedDialog"
+$form.MaximizeBox = $false
 
-$lblTitle = New-Object System.Windows.Forms.Label
-$lblTitle.Text = "SPOTLIGHT MANAGER"
-$lblTitle.Font = $fontTitle
-$lblTitle.ForeColor = $clrAccent
-$lblTitle.Location = New-Object System.Drawing.Point(20, 15)
-$lblTitle.Size = New-Object System.Drawing.Size(400, 30)
-$lblTitle.Anchor = "Top,Left"
-$form.Controls.Add($lblTitle)
+$picBox = New-Object System.Windows.Forms.PictureBox
+$picBox.Location = New-Object System.Drawing.Point(15, 15)
+$picBox.Size = New-Object System.Drawing.Size(530, 200)
+$picBox.BorderStyle = "FixedSingle"
+$picBox.SizeMode = "Zoom"
+$form.Controls.Add($picBox)
 
-$picPanel = New-Object System.Windows.Forms.Panel
-$picPanel.Location = New-Object System.Drawing.Point(20, 55)
-$picPanel.Size = New-Object System.Drawing.Size(546, 260)
-$picPanel.Anchor = "Top,Left,Right,Bottom"
-$picPanel.BackColor = [System.Drawing.Color]::Black
-$form.Controls.Add($picPanel)
+$lblInfo = New-Object System.Windows.Forms.Label
+$lblInfo.Location = New-Object System.Drawing.Point(15, 220)
+$lblInfo.Size = New-Object System.Drawing.Size(530, 20)
+$lblInfo.Font = New-Object System.Drawing.Font($lblInfo.Font, [System.Drawing.FontStyle]::Italic)
+$lblInfo.AutoEllipsis = $true
+$form.Controls.Add($lblInfo)
 
-# Custom "cover" draw (crop-to-fill, no letterboxing) so the preview
-# mirrors exactly how Windows itself renders a Fill-style wallpaper,
-# instead of PictureBox's Zoom mode which pads with black bars.
-$script:currentImage = $null
-$picPanel.Add_Paint({
-    param($sender, $e)
-    if ($script:currentImage) {
-        $img = $script:currentImage
-        $panelW = $picPanel.ClientSize.Width
-        $panelH = $picPanel.ClientSize.Height
-        if ($panelW -gt 0 -and $panelH -gt 0) {
-            $scale = [Math]::Max($panelW / $img.Width, $panelH / $img.Height)
-            $destW = $img.Width * $scale
-            $destH = $img.Height * $scale
-            $destX = ($panelW - $destW) / 2
-            $destY = ($panelH - $destH) / 2
-            $e.Graphics.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
-            $e.Graphics.DrawImage($img, $destX, $destY, $destW, $destH)
-        }
-    }
-    $borderPen = New-Object System.Drawing.Pen($clrAccent, 1)
-    $e.Graphics.DrawRectangle($borderPen, 0, 0, $picPanel.ClientSize.Width - 1, $picPanel.ClientSize.Height - 1)
-    $borderPen.Dispose()
-})
-$picPanel.Add_Resize({ $picPanel.Invalidate() })
-
-$btnPrev = New-FlatButton "< PREVIOUS" $clrPanel2
-$btnPrev.Location = New-Object System.Drawing.Point(20, 325)
-$btnPrev.Size = New-Object System.Drawing.Size(120, 34)
-$btnPrev.Anchor = "Bottom,Left"
+$btnPrev = New-Object System.Windows.Forms.Button
+$btnPrev.Text = "< Previous"
+$btnPrev.Location = New-Object System.Drawing.Point(15, 245)
+$btnPrev.Size = New-Object System.Drawing.Size(110, 30)
 $form.Controls.Add($btnPrev)
 
-$btnNext = New-FlatButton "NEXT >" $clrAccent
-$btnNext.Location = New-Object System.Drawing.Point(446, 325)
-$btnNext.Size = New-Object System.Drawing.Size(120, 34)
-$btnNext.Anchor = "Bottom,Right"
-$form.Controls.Add($btnNext)
+$btnLearnMore = New-Object System.Windows.Forms.Button
+$btnLearnMore.Text = "Learn More"
+$btnLearnMore.Location = New-Object System.Drawing.Point(135, 245)
+$btnLearnMore.Size = New-Object System.Drawing.Size(150, 30)
+$btnLearnMore.Enabled = $false
+$form.Controls.Add($btnLearnMore)
 
 $lblStatus = New-Object System.Windows.Forms.Label
-$lblStatus.ForeColor = $clrMuted
-$lblStatus.Location = New-Object System.Drawing.Point(20, 365)
-$lblStatus.Size = New-Object System.Drawing.Size(546, 20)
+$lblStatus.Location = New-Object System.Drawing.Point(295, 250)
+$lblStatus.Size = New-Object System.Drawing.Size(120, 20)
 $lblStatus.TextAlign = "MiddleCenter"
-$lblStatus.Anchor = "Bottom,Left,Right"
 $form.Controls.Add($lblStatus)
 
-$groupBox = New-Object System.Windows.Forms.Panel
-$groupBox.Location = New-Object System.Drawing.Point(20, 395)
-$groupBox.Size = New-Object System.Drawing.Size(546, 70)
-$groupBox.Anchor = "Bottom,Left,Right"
-$groupBox.BackColor = $clrPanel
+$btnNext = New-Object System.Windows.Forms.Button
+$btnNext.Text = "Next >"
+$btnNext.Location = New-Object System.Drawing.Point(425, 245)
+$btnNext.Size = New-Object System.Drawing.Size(120, 30)
+$form.Controls.Add($btnNext)
+
+$groupBox = New-Object System.Windows.Forms.GroupBox
+$groupBox.Text = "Auto-refresh interval"
+$groupBox.Location = New-Object System.Drawing.Point(15, 285)
+$groupBox.Size = New-Object System.Drawing.Size(530, 60)
 $form.Controls.Add($groupBox)
 
-$lblGroupTitle = New-Object System.Windows.Forms.Label
-$lblGroupTitle.Text = "AUTO-REFRESH INTERVAL"
-$lblGroupTitle.ForeColor = $clrMuted
-$lblGroupTitle.Font = New-Object System.Drawing.Font("Segoe UI", 8, [System.Drawing.FontStyle]::Bold)
-$lblGroupTitle.Location = New-Object System.Drawing.Point(15, 8)
-$lblGroupTitle.Size = New-Object System.Drawing.Size(300, 16)
-$groupBox.Controls.Add($lblGroupTitle)
-
 $numInterval = New-Object System.Windows.Forms.NumericUpDown
-$numInterval.Location = New-Object System.Drawing.Point(15, 32)
-$numInterval.Size = New-Object System.Drawing.Size(60, 25)
+$numInterval.Location = New-Object System.Drawing.Point(15, 25)
+$numInterval.Size = New-Object System.Drawing.Size(70, 25)
 $numInterval.Minimum = 1
 $numInterval.Maximum = 999
 $numInterval.Value = 1
-$numInterval.BackColor = $clrPanel2
-$numInterval.ForeColor = $clrText
-$numInterval.BorderStyle = "FixedSingle"
 $groupBox.Controls.Add($numInterval)
 
 $cmbUnit = New-Object System.Windows.Forms.ComboBox
-$cmbUnit.Location = New-Object System.Drawing.Point(85, 32)
-$cmbUnit.Size = New-Object System.Drawing.Size(95, 25)
+$cmbUnit.Location = New-Object System.Drawing.Point(95, 25)
+$cmbUnit.Size = New-Object System.Drawing.Size(100, 25)
 $cmbUnit.DropDownStyle = "DropDownList"
-$cmbUnit.FlatStyle = "Flat"
-$cmbUnit.BackColor = $clrPanel2
-$cmbUnit.ForeColor = $clrText
 $cmbUnit.Items.AddRange(@("Minutes", "Hours", "Days"))
 $cmbUnit.SelectedIndex = 1
 $groupBox.Controls.Add($cmbUnit)
 
-$btnEnable = New-FlatButton "ENABLE" $clrAccent
-$btnEnable.Location = New-Object System.Drawing.Point(195, 30)
-$btnEnable.Size = New-Object System.Drawing.Size(85, 28)
-$btnEnable.Font = New-Object System.Drawing.Font("Segoe UI", 8.5, [System.Drawing.FontStyle]::Bold)
+$btnEnable = New-Object System.Windows.Forms.Button
+$btnEnable.Text = "Enable"
+$btnEnable.Location = New-Object System.Drawing.Point(210, 23)
+$btnEnable.Size = New-Object System.Drawing.Size(90, 28)
 $groupBox.Controls.Add($btnEnable)
 
-$btnDisable = New-FlatButton "DISABLE" $clrPanel2
-$btnDisable.Location = New-Object System.Drawing.Point(290, 30)
-$btnDisable.Size = New-Object System.Drawing.Size(85, 28)
-$btnDisable.Font = New-Object System.Drawing.Font("Segoe UI", 8.5, [System.Drawing.FontStyle]::Bold)
+$btnDisable = New-Object System.Windows.Forms.Button
+$btnDisable.Text = "Disable"
+$btnDisable.Location = New-Object System.Drawing.Point(310, 23)
+$btnDisable.Size = New-Object System.Drawing.Size(90, 28)
 $groupBox.Controls.Add($btnDisable)
 
 $lblSchedule = New-Object System.Windows.Forms.Label
-$lblSchedule.Location = New-Object System.Drawing.Point(390, 36)
-$lblSchedule.Size = New-Object System.Drawing.Size(145, 20)
-$lblSchedule.ForeColor = $clrMuted
-$lblSchedule.Font = New-Object System.Drawing.Font("Segoe UI", 8.5, [System.Drawing.FontStyle]::Italic)
+$lblSchedule.Location = New-Object System.Drawing.Point(410, 28)
+$lblSchedule.Size = New-Object System.Drawing.Size(115, 20)
+$lblSchedule.Font = New-Object System.Drawing.Font($lblSchedule.Font, [System.Drawing.FontStyle]::Italic)
 $groupBox.Controls.Add($lblSchedule)
 
-$btnDiag = New-FlatButton "RUN DIAGNOSTICS && FIX" $clrPanel2
-$btnDiag.Location = New-Object System.Drawing.Point(20, 475)
-$btnDiag.Size = New-Object System.Drawing.Size(546, 34)
-$btnDiag.Anchor = "Bottom,Left,Right"
+$chkShortcut = New-Object System.Windows.Forms.CheckBox
+$chkShortcut.Text = "Show 'Learn More' icon on desktop"
+$chkShortcut.Location = New-Object System.Drawing.Point(15, 355)
+$chkShortcut.Size = New-Object System.Drawing.Size(530, 24)
+$form.Controls.Add($chkShortcut)
+
+$btnDiag = New-Object System.Windows.Forms.Button
+$btnDiag.Text = "Run Diagnostics && Fix"
+$btnDiag.Location = New-Object System.Drawing.Point(15, 385)
+$btnDiag.Size = New-Object System.Drawing.Size(530, 30)
 $form.Controls.Add($btnDiag)
 
 $txtLog = New-Object System.Windows.Forms.TextBox
-$txtLog.Location = New-Object System.Drawing.Point(20, 518)
-$txtLog.Size = New-Object System.Drawing.Size(546, 55)
-$txtLog.Anchor = "Bottom,Left,Right"
+$txtLog.Location = New-Object System.Drawing.Point(15, 425)
+$txtLog.Size = New-Object System.Drawing.Size(530, 80)
 $txtLog.Multiline = $true
 $txtLog.ScrollBars = "Vertical"
 $txtLog.ReadOnly = $true
-$txtLog.BackColor = $clrPanel
-$txtLog.ForeColor = [System.Drawing.Color]::FromArgb(255, 140, 220, 150)
-$txtLog.BorderStyle = "FixedSingle"
 $txtLog.Font = New-Object System.Drawing.Font("Consolas", 8)
 $form.Controls.Add($txtLog)
 
@@ -673,15 +620,29 @@ function Refresh-ScheduleLabel {
     }
 }
 
-function Update-Image($path) {
-    if ($path -and (Test-Path $path)) {
-        if ($script:currentImage) { $script:currentImage.Dispose() }
-        $script:currentImage = [System.Drawing.Image]::FromFile($path)
-        $picPanel.Invalidate()
+$script:CurrentLearnMoreUrl = $null
+
+function Update-Image($entry) {
+    if ($entry -and $entry.Path -and (Test-Path $entry.Path)) {
+        if ($picBox.Image) { $picBox.Image.Dispose() }
+        $picBox.Image = [System.Drawing.Image]::FromFile($entry.Path)
         $state = Get-State
         $lblStatus.Text = "Image $($state.Index + 1) of $($state.Images.Count)"
+
+        if ($entry.Title -or $entry.Copyright) {
+            $parts = @($entry.Title, $entry.Copyright) | Where-Object { $_ }
+            $lblInfo.Text = [string]::Join("  -  ", $parts)
+        } else {
+            $lblInfo.Text = ""
+        }
+
+        $script:CurrentLearnMoreUrl = $entry.LearnMoreUrl
+        $btnLearnMore.Enabled = [bool]$entry.LearnMoreUrl
     } else {
         $lblStatus.Text = "No image available"
+        $lblInfo.Text = ""
+        $script:CurrentLearnMoreUrl = $null
+        $btnLearnMore.Enabled = $false
     }
 }
 
@@ -689,12 +650,18 @@ $btnNext.Add_Click({
     $btnNext.Enabled = $false; $btnPrev.Enabled = $false
     $form.Cursor = "WaitCursor"
     try {
-        $path = Move-SpotlightImage -Direction "Next"
-        Update-Image $path
-        if (-not $path) { Append-Log "Could not fetch/display a new image. Check log.txt for details." }
+        $entry = Move-SpotlightImage -Direction "Next"
+        Update-Image $entry
+        if (-not $entry) { Append-Log "Could not fetch/display a new image. Check log.txt for details." }
     } finally {
         $form.Cursor = "Default"
         $btnNext.Enabled = $true; $btnPrev.Enabled = $true
+    }
+})
+
+$btnLearnMore.Add_Click({
+    if ($script:CurrentLearnMoreUrl) {
+        Open-LearnMoreLink -Url $script:CurrentLearnMoreUrl
     }
 })
 
@@ -702,8 +669,8 @@ $btnPrev.Add_Click({
     $btnPrev.Enabled = $false; $btnNext.Enabled = $false
     $form.Cursor = "WaitCursor"
     try {
-        $path = Move-SpotlightImage -Direction "Previous"
-        Update-Image $path
+        $entry = Move-SpotlightImage -Direction "Previous"
+        Update-Image $entry
     } finally {
         $form.Cursor = "Default"
         $btnPrev.Enabled = $true; $btnNext.Enabled = $true
@@ -744,8 +711,23 @@ $btnDisable.Add_Click({
     Refresh-ScheduleLabel
 })
 
+$script:InitializingShortcutCheckbox = $false
+
+$chkShortcut.Add_CheckedChanged({
+    if ($script:InitializingShortcutCheckbox) { return }
+    if ($chkShortcut.Checked) {
+        if (New-LearnMoreShortcut) {
+            Append-Log "Added 'Spotlight - Learn More' icon to the desktop."
+        } else {
+            Append-Log "Failed to create the desktop icon. Check log.txt."
+        }
+    } else {
+        Remove-LearnMoreShortcut | Out-Null
+        Append-Log "Removed the desktop icon."
+    }
+})
+
 $form.Add_Shown({
-    Start-IntroJingle
     Refresh-ScheduleLabel
     $state = Get-State
     if ($state.Images.Count -gt 0 -and $state.Index -ge 0) {
@@ -753,7 +735,12 @@ $form.Add_Shown({
     } else {
         Append-Log "No cached images yet. Click 'Next' to fetch the first one."
     }
+
+    $script:InitializingShortcutCheckbox = $true
+    $chkShortcut.Checked = Test-LearnMoreShortcutExists
+    $script:InitializingShortcutCheckbox = $false
 })
 
 [System.Windows.Forms.Application]::EnableVisualStyles()
 [System.Windows.Forms.Application]::Run($form)
+
