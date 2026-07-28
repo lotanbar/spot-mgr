@@ -6,14 +6,6 @@ param(
     [string]$ExportSource
 )
 
-# Set to $true only for the seconds-capable debug build (see build.ps1).
-# Task Scheduler hard-rejects repetition intervals under 60 seconds, so when
-# this is on and the user picks a sub-minute interval, the app falls back to
-# an in-process timer instead of a real scheduled task. That timer only runs
-# while this app instance stays open - it is a session-only debugging aid,
-# not a replacement for the real auto-refresh mechanism.
-$Script:IsDebugBuild = $false
-
 # Base64 of a zip of the git repo (source + full history) this exe was built
 # from. Filled in by build.ps1 at compile time - stays $null if you run the
 # .ps1 directly. Not auto-extracted on startup (that would add overhead/
@@ -362,8 +354,7 @@ function Format-Interval {
     if ($Interval.Days -gt 0)    { $parts += "$($Interval.Days)d" }
     if ($Interval.Hours -gt 0)   { $parts += "$($Interval.Hours)h" }
     if ($Interval.Minutes -gt 0) { $parts += "$($Interval.Minutes)m" }
-    if ($Interval.Seconds -gt 0) { $parts += "$($Interval.Seconds)s" }
-    if ($parts.Count -eq 0) { return "0s" }
+    if ($parts.Count -eq 0) { return "0m" }
     return ($parts -join " ")
 }
 
@@ -459,36 +450,6 @@ function Get-AutoRefreshSchedule {
         # not a TimeSpan object, so it needs explicit parsing.
         return [System.Xml.XmlConvert]::ToTimeSpan($intervalStr)
     } catch { return $null }
-}
-
-# -----------------------------------------------------------------
-# Debug-only in-process fallback for sub-minute intervals (see
-# $Script:IsDebugBuild above). Ticks for as long as this app instance
-# stays open; closing the app or logging off stops it - unlike the real
-# scheduled task, it is not persistent.
-# -----------------------------------------------------------------
-$script:DebugTimer = $null
-$script:DebugTimerInterval = $null
-
-function Start-DebugInProcessTimer {
-    param([TimeSpan]$Interval, [scriptblock]$OnTick)
-
-    Stop-DebugInProcessTimer
-    $script:DebugTimer = New-Object System.Windows.Forms.Timer
-    $script:DebugTimer.Interval = [Math]::Max(1, [int]$Interval.TotalMilliseconds)
-    $script:DebugTimer.Add_Tick($OnTick)
-    $script:DebugTimer.Start()
-    $script:DebugTimerInterval = $Interval
-    Write-Log "Debug in-process timer started, every $(Format-Interval $Interval) (session-only, stops when the app closes)."
-}
-
-function Stop-DebugInProcessTimer {
-    if ($script:DebugTimer) {
-        $script:DebugTimer.Stop()
-        $script:DebugTimer.Dispose()
-        $script:DebugTimer = $null
-        $script:DebugTimerInterval = $null
-    }
 }
 
 # -----------------------------------------------------------------
@@ -620,65 +581,145 @@ if ($OpenLearnMore) {
 }
 
 # ============================================================
-# GUI
+# GUI - dark theme
 # ============================================================
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
+$clrBg      = [System.Drawing.Color]::FromArgb(255, 18, 18, 22)
+$clrPanel   = [System.Drawing.Color]::FromArgb(255, 30, 30, 36)
+$clrPanel2  = [System.Drawing.Color]::FromArgb(255, 40, 40, 48)
+$clrAccent  = [System.Drawing.Color]::FromArgb(255, 130, 90, 255)
+$clrText    = [System.Drawing.Color]::FromArgb(255, 235, 235, 240)
+$clrMuted   = [System.Drawing.Color]::FromArgb(255, 150, 150, 160)
+$fontMain   = New-Object System.Drawing.Font("Segoe UI", 9.5)
+$fontBold   = New-Object System.Drawing.Font("Segoe UI Semibold", 10)
+$fontTitle  = New-Object System.Drawing.Font("Segoe UI Semibold", 13)
+
+function New-FlatButton {
+    param([string]$Text, [System.Drawing.Color]$Back, [System.Drawing.Color]$Fore = $clrText)
+    $b = New-Object System.Windows.Forms.Button
+    $b.Text = $Text
+    $b.FlatStyle = "Flat"
+    $b.FlatAppearance.BorderSize = 0
+    $b.BackColor = $Back
+    $b.ForeColor = $Fore
+    $b.Font = $fontBold
+    $b.Cursor = "Hand"
+    return $b
+}
+
 $form = New-Object System.Windows.Forms.Form
-$form.Text = if ($Script:IsDebugBuild) { "Spotlight Manager (DEBUG)" } else { "Spotlight Manager" }
-$form.Size = New-Object System.Drawing.Size(560, 580)
+$form.Text = "Spotlight Manager"
+$form.Size = New-Object System.Drawing.Size(620, 700)
+$form.MinimumSize = New-Object System.Drawing.Size(620, 700)
 $form.StartPosition = "CenterScreen"
-$form.FormBorderStyle = "FixedDialog"
-$form.MaximizeBox = $false
+$form.FormBorderStyle = "Sizable"
+$form.MaximizeBox = $true
+$form.MinimizeBox = $true
+$form.BackColor = $clrBg
+$form.ForeColor = $clrText
+$form.Font = $fontMain
 
-$picBox = New-Object System.Windows.Forms.PictureBox
-$picBox.Location = New-Object System.Drawing.Point(15, 15)
-$picBox.Size = New-Object System.Drawing.Size(530, 200)
-$picBox.BorderStyle = "FixedSingle"
-$picBox.SizeMode = "Zoom"
-$form.Controls.Add($picBox)
+$lblTitle = New-Object System.Windows.Forms.Label
+$lblTitle.Text = "SPOTLIGHT MANAGER"
+$lblTitle.Font = $fontTitle
+$lblTitle.ForeColor = $clrAccent
+$lblTitle.Location = New-Object System.Drawing.Point(20, 15)
+$lblTitle.Size = New-Object System.Drawing.Size(400, 30)
+$lblTitle.Anchor = "Top,Left"
+$form.Controls.Add($lblTitle)
 
+$picPanel = New-Object System.Windows.Forms.Panel
+$picPanel.Location = New-Object System.Drawing.Point(20, 55)
+$picPanel.Size = New-Object System.Drawing.Size(566, 270)
+$picPanel.Anchor = "Top,Left,Right,Bottom"
+$picPanel.BackColor = [System.Drawing.Color]::Black
+$form.Controls.Add($picPanel)
+
+# Custom "cover" draw (crop-to-fill, no letterboxing) so the preview mirrors
+# how Windows itself renders a Fill-style wallpaper, instead of PictureBox's
+# Zoom mode which pads with black bars.
+$script:currentImage = $null
+$picPanel.Add_Paint({
+    param($sender, $e)
+    if ($script:currentImage) {
+        $img = $script:currentImage
+        $panelW = $picPanel.ClientSize.Width
+        $panelH = $picPanel.ClientSize.Height
+        if ($panelW -gt 0 -and $panelH -gt 0) {
+            $scale = [Math]::Max($panelW / $img.Width, $panelH / $img.Height)
+            $destW = $img.Width * $scale
+            $destH = $img.Height * $scale
+            $destX = ($panelW - $destW) / 2
+            $destY = ($panelH - $destH) / 2
+            $e.Graphics.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+            $e.Graphics.DrawImage($img, $destX, $destY, $destW, $destH)
+        }
+    }
+    $borderPen = New-Object System.Drawing.Pen($clrAccent, 1)
+    $e.Graphics.DrawRectangle($borderPen, 0, 0, $picPanel.ClientSize.Width - 1, $picPanel.ClientSize.Height - 1)
+    $borderPen.Dispose()
+})
+$picPanel.Add_Resize({ $picPanel.Invalidate() })
+
+# Caption bar overlaid on the bottom edge of the preview, instead of a
+# separate row - keeps the image itself the focal point.
 $lblInfo = New-Object System.Windows.Forms.Label
-$lblInfo.Location = New-Object System.Drawing.Point(15, 220)
-$lblInfo.Size = New-Object System.Drawing.Size(530, 20)
-$lblInfo.Font = New-Object System.Drawing.Font($lblInfo.Font, [System.Drawing.FontStyle]::Italic)
+$lblInfo.Location = New-Object System.Drawing.Point(0, 240)
+$lblInfo.Size = New-Object System.Drawing.Size(566, 30)
+$lblInfo.Anchor = "Bottom,Left,Right"
+$lblInfo.BackColor = [System.Drawing.Color]::FromArgb(200, 18, 18, 22)
+$lblInfo.ForeColor = $clrText
+$lblInfo.TextAlign = "MiddleLeft"
+$lblInfo.Padding = New-Object System.Windows.Forms.Padding(10, 0, 10, 0)
 $lblInfo.AutoEllipsis = $true
-$form.Controls.Add($lblInfo)
+$picPanel.Controls.Add($lblInfo)
 
-$btnPrev = New-Object System.Windows.Forms.Button
-$btnPrev.Text = "< Previous"
-$btnPrev.Location = New-Object System.Drawing.Point(15, 245)
-$btnPrev.Size = New-Object System.Drawing.Size(110, 30)
+$btnPrev = New-FlatButton "< PREVIOUS" $clrPanel2
+$btnPrev.Location = New-Object System.Drawing.Point(20, 335)
+$btnPrev.Size = New-Object System.Drawing.Size(100, 34)
+$btnPrev.Anchor = "Bottom,Left"
 $form.Controls.Add($btnPrev)
 
-$btnLearnMore = New-Object System.Windows.Forms.Button
-$btnLearnMore.Text = "Learn More"
-$btnLearnMore.Location = New-Object System.Drawing.Point(135, 245)
-$btnLearnMore.Size = New-Object System.Drawing.Size(150, 30)
+$btnLearnMore = New-FlatButton "LEARN MORE" $clrPanel2
+$btnLearnMore.Location = New-Object System.Drawing.Point(130, 335)
+$btnLearnMore.Size = New-Object System.Drawing.Size(140, 34)
+$btnLearnMore.Anchor = "Bottom,Left"
 $btnLearnMore.Enabled = $false
 $form.Controls.Add($btnLearnMore)
 
 $lblStatus = New-Object System.Windows.Forms.Label
-$lblStatus.Location = New-Object System.Drawing.Point(295, 250)
-$lblStatus.Size = New-Object System.Drawing.Size(120, 20)
+$lblStatus.Location = New-Object System.Drawing.Point(280, 340)
+$lblStatus.Size = New-Object System.Drawing.Size(126, 24)
+$lblStatus.ForeColor = $clrMuted
 $lblStatus.TextAlign = "MiddleCenter"
+$lblStatus.Anchor = "Bottom,Left"
 $form.Controls.Add($lblStatus)
 
-$btnNext = New-Object System.Windows.Forms.Button
-$btnNext.Text = "Next >"
-$btnNext.Location = New-Object System.Drawing.Point(425, 245)
-$btnNext.Size = New-Object System.Drawing.Size(120, 30)
+$btnNext = New-FlatButton "NEXT >" $clrAccent
+$btnNext.Location = New-Object System.Drawing.Point(430, 335)
+$btnNext.Size = New-Object System.Drawing.Size(156, 34)
+$btnNext.Anchor = "Bottom,Right"
 $form.Controls.Add($btnNext)
 
-$groupBox = New-Object System.Windows.Forms.GroupBox
-$groupBox.Text = "Auto-refresh interval"
-$groupBox.Location = New-Object System.Drawing.Point(15, 285)
-$groupBox.Size = New-Object System.Drawing.Size(530, 90)
+$groupBox = New-Object System.Windows.Forms.Panel
+$groupBox.Location = New-Object System.Drawing.Point(20, 385)
+$groupBox.Size = New-Object System.Drawing.Size(566, 90)
+$groupBox.Anchor = "Bottom,Left,Right"
+$groupBox.BackColor = $clrPanel
 $form.Controls.Add($groupBox)
 
-# Days / Hours / Minutes (/ Seconds, debug build only) fields, each with a
-# unit label above it, combined into one TimeSpan when the schedule is set.
+$lblGroupTitle = New-Object System.Windows.Forms.Label
+$lblGroupTitle.Text = "AUTO-REFRESH INTERVAL"
+$lblGroupTitle.ForeColor = $clrMuted
+$lblGroupTitle.Font = New-Object System.Drawing.Font("Segoe UI", 8, [System.Drawing.FontStyle]::Bold)
+$lblGroupTitle.Location = New-Object System.Drawing.Point(15, 8)
+$lblGroupTitle.Size = New-Object System.Drawing.Size(300, 16)
+$groupBox.Controls.Add($lblGroupTitle)
+
+# Days / Hours / Minutes fields, each with a unit label above it, combined
+# into one TimeSpan when the schedule is set.
 $unitFieldWidth = 60
 $unitSpacing    = 70
 $unitX          = 15
@@ -688,68 +729,75 @@ function New-IntervalUnitField {
 
     $lbl = New-Object System.Windows.Forms.Label
     $lbl.Text = $LabelText
-    $lbl.Location = New-Object System.Drawing.Point($X, 20)
+    $lbl.ForeColor = $clrMuted
+    $lbl.Location = New-Object System.Drawing.Point($X, 26)
     $lbl.Size = New-Object System.Drawing.Size($unitFieldWidth, 16)
     $groupBox.Controls.Add($lbl)
 
     $num = New-Object System.Windows.Forms.NumericUpDown
-    $num.Location = New-Object System.Drawing.Point($X, 38)
+    $num.Location = New-Object System.Drawing.Point($X, 44)
     $num.Size = New-Object System.Drawing.Size($unitFieldWidth, 25)
     $num.Minimum = 0
     $num.Maximum = $Max
     $num.Value = 0
+    $num.BackColor = $clrPanel2
+    $num.ForeColor = $clrText
+    $num.BorderStyle = "FixedSingle"
     $groupBox.Controls.Add($num)
     return $num
 }
 
-$numDays    = New-IntervalUnitField -LabelText "Days"    -X ($unitX)                     -Max 3650
-$numHours   = New-IntervalUnitField -LabelText "Hours"   -X ($unitX + $unitSpacing)       -Max 23
-$numMinutes = New-IntervalUnitField -LabelText "Minutes" -X ($unitX + $unitSpacing * 2)   -Max 59
+$numDays    = New-IntervalUnitField -LabelText "Days"    -X ($unitX)                   -Max 3650
+$numHours   = New-IntervalUnitField -LabelText "Hours"   -X ($unitX + $unitSpacing)     -Max 23
+$numMinutes = New-IntervalUnitField -LabelText "Minutes" -X ($unitX + $unitSpacing * 2) -Max 59
 $numMinutes.Value = 1
 
 $buttonsX = $unitX + $unitSpacing * 3
-if ($Script:IsDebugBuild) {
-    $numSeconds = New-IntervalUnitField -LabelText "Seconds (debug)" -X ($unitX + $unitSpacing * 3) -Max 59
-    $buttonsX = $unitX + $unitSpacing * 4
-}
 
-$btnEnable = New-Object System.Windows.Forms.Button
-$btnEnable.Text = "Enable"
-$btnEnable.Location = New-Object System.Drawing.Point($buttonsX, 38)
-$btnEnable.Size = New-Object System.Drawing.Size(90, 28)
+$btnEnable = New-FlatButton "ENABLE" $clrAccent
+$btnEnable.Location = New-Object System.Drawing.Point($buttonsX, 42)
+$btnEnable.Size = New-Object System.Drawing.Size(85, 28)
+$btnEnable.Font = New-Object System.Drawing.Font("Segoe UI", 8.5, [System.Drawing.FontStyle]::Bold)
 $groupBox.Controls.Add($btnEnable)
 
-$btnDisable = New-Object System.Windows.Forms.Button
-$btnDisable.Text = "Disable"
-$btnDisable.Location = New-Object System.Drawing.Point(($buttonsX + 95), 38)
-$btnDisable.Size = New-Object System.Drawing.Size(90, 28)
+$btnDisable = New-FlatButton "DISABLE" $clrPanel2
+$btnDisable.Location = New-Object System.Drawing.Point(($buttonsX + 90), 42)
+$btnDisable.Size = New-Object System.Drawing.Size(85, 28)
+$btnDisable.Font = New-Object System.Drawing.Font("Segoe UI", 8.5, [System.Drawing.FontStyle]::Bold)
 $groupBox.Controls.Add($btnDisable)
 
 $lblSchedule = New-Object System.Windows.Forms.Label
-$lblSchedule.Location = New-Object System.Drawing.Point($unitX, 68)
-$lblSchedule.Size = New-Object System.Drawing.Size(495, 18)
-$lblSchedule.Font = New-Object System.Drawing.Font($lblSchedule.Font, [System.Drawing.FontStyle]::Italic)
+$lblSchedule.Location = New-Object System.Drawing.Point(($buttonsX + 180), 48)
+$lblSchedule.Size = New-Object System.Drawing.Size(186, 20)
+$lblSchedule.ForeColor = $clrMuted
+$lblSchedule.Font = New-Object System.Drawing.Font("Segoe UI", 8.5, [System.Drawing.FontStyle]::Italic)
 $groupBox.Controls.Add($lblSchedule)
 
 $chkShortcut = New-Object System.Windows.Forms.CheckBox
 $chkShortcut.Text = "Show 'Learn More' icon on desktop"
-$chkShortcut.Location = New-Object System.Drawing.Point(15, 385)
-$chkShortcut.Size = New-Object System.Drawing.Size(530, 24)
+$chkShortcut.ForeColor = $clrText
+$chkShortcut.Location = New-Object System.Drawing.Point(20, 485)
+$chkShortcut.Size = New-Object System.Drawing.Size(566, 24)
+$chkShortcut.Anchor = "Bottom,Left,Right"
 $form.Controls.Add($chkShortcut)
 
-$btnDiag = New-Object System.Windows.Forms.Button
-$btnDiag.Text = "Run Diagnostics && Fix"
-$btnDiag.Location = New-Object System.Drawing.Point(15, 415)
-$btnDiag.Size = New-Object System.Drawing.Size(530, 30)
+$btnDiag = New-FlatButton "RUN DIAGNOSTICS && FIX" $clrPanel2
+$btnDiag.Location = New-Object System.Drawing.Point(20, 519)
+$btnDiag.Size = New-Object System.Drawing.Size(566, 34)
+$btnDiag.Anchor = "Bottom,Left,Right"
 $form.Controls.Add($btnDiag)
 
 $txtLog = New-Object System.Windows.Forms.TextBox
-$txtLog.Location = New-Object System.Drawing.Point(15, 455)
-$txtLog.Size = New-Object System.Drawing.Size(530, 80)
+$txtLog.Location = New-Object System.Drawing.Point(20, 563)
+$txtLog.Size = New-Object System.Drawing.Size(566, 70)
+$txtLog.Anchor = "Bottom,Left,Right"
 $txtLog.Multiline = $true
 $txtLog.ScrollBars = "Vertical"
 $txtLog.ReadOnly = $true
 $txtLog.Font = New-Object System.Drawing.Font("Consolas", 8)
+$txtLog.BackColor = $clrPanel
+$txtLog.ForeColor = [System.Drawing.Color]::FromArgb(255, 140, 220, 150)
+$txtLog.BorderStyle = "FixedSingle"
 $form.Controls.Add($txtLog)
 
 function Append-Log($msg) {
@@ -757,10 +805,6 @@ function Append-Log($msg) {
 }
 
 function Refresh-ScheduleLabel {
-    if ($script:DebugTimer) {
-        $lblSchedule.Text = "DEBUG in-process timer active: every $(Format-Interval $script:DebugTimerInterval) (session-only)"
-        return
-    }
     $interval = Get-AutoRefreshSchedule
     if ($interval) {
         $lblSchedule.Text = "Active: every $(Format-Interval $interval)"
@@ -773,8 +817,9 @@ $script:CurrentLearnMoreUrl = $null
 
 function Update-Image($entry) {
     if ($entry -and $entry.Path -and (Test-Path $entry.Path)) {
-        if ($picBox.Image) { $picBox.Image.Dispose() }
-        $picBox.Image = [System.Drawing.Image]::FromFile($entry.Path)
+        if ($script:currentImage) { $script:currentImage.Dispose() }
+        $script:currentImage = [System.Drawing.Image]::FromFile($entry.Path)
+        $picPanel.Invalidate()
         $state = Get-State
         $lblStatus.Text = "Image $($state.Index + 1) of $($state.Images.Count)"
 
@@ -841,38 +886,26 @@ $btnDiag.Add_Click({
 })
 
 $btnEnable.Add_Click({
-    $seconds = 0
-    if ($Script:IsDebugBuild) { $seconds = [int]$numSeconds.Value }
-    $interval = New-TimeSpan -Days ([int]$numDays.Value) -Hours ([int]$numHours.Value) -Minutes ([int]$numMinutes.Value) -Seconds $seconds
+    $interval = New-TimeSpan -Days ([int]$numDays.Value) -Hours ([int]$numHours.Value) -Minutes ([int]$numMinutes.Value)
 
     if ($interval.TotalSeconds -le 0) {
         Append-Log "Enter an interval greater than zero."
         return
     }
+    if ($interval.TotalSeconds -lt 60) {
+        Append-Log "Task Scheduler can't repeat faster than once a minute - enter at least 1 minute."
+        return
+    }
 
-    if ($Script:IsDebugBuild -and $interval.TotalSeconds -lt 60) {
-        # Task Scheduler cannot repeat faster than once a minute, so this
-        # debug-only path drives the rotation directly from the running
-        # process instead - see Start-DebugInProcessTimer above.
-        Remove-AutoRefreshSchedule | Out-Null
-        Start-DebugInProcessTimer -Interval $interval -OnTick {
-            $entry = Move-SpotlightImage -Direction "Next"
-            Update-Image $entry
-        }
-        Append-Log "DEBUG: using in-process timer every $(Format-Interval $interval) (under Task Scheduler's 60s floor - session-only)."
+    if (Set-AutoRefreshSchedule -Interval $interval) {
+        Append-Log "Auto-refresh enabled: every $(Format-Interval $interval)."
     } else {
-        Stop-DebugInProcessTimer
-        if (Set-AutoRefreshSchedule -Interval $interval) {
-            Append-Log "Auto-refresh enabled: every $(Format-Interval $interval)."
-        } else {
-            Append-Log "Failed to enable auto-refresh. Check log.txt for details."
-        }
+        Append-Log "Failed to enable auto-refresh. Check log.txt for details."
     }
     Refresh-ScheduleLabel
 })
 
 $btnDisable.Add_Click({
-    Stop-DebugInProcessTimer
     Remove-AutoRefreshSchedule | Out-Null
     Append-Log "Auto-refresh disabled."
     Refresh-ScheduleLabel
@@ -907,8 +940,6 @@ $form.Add_Shown({
     $chkShortcut.Checked = Test-LearnMoreShortcutExists
     $script:InitializingShortcutCheckbox = $false
 })
-
-$form.Add_FormClosing({ Stop-DebugInProcessTimer })
 
 [System.Windows.Forms.Application]::EnableVisualStyles()
 [System.Windows.Forms.Application]::Run($form)
