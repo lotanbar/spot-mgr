@@ -2,7 +2,8 @@ param(
     [switch]$Silent,
     [switch]$Refresh,
     [switch]$ElevatedFix,
-    [switch]$OpenLearnMore
+    [switch]$OpenLearnMore,
+    [string]$ExportSource
 )
 
 # Set to $true only for the seconds-capable debug build (see build.ps1).
@@ -12,6 +13,29 @@ param(
 # while this app instance stays open - it is a session-only debugging aid,
 # not a replacement for the real auto-refresh mechanism.
 $Script:IsDebugBuild = $false
+
+# Base64 of a zip of the git repo (source + full history) this exe was built
+# from. Filled in by build.ps1 at compile time - stays $null if you run the
+# .ps1 directly. Not auto-extracted on startup (that would add overhead/
+# clutter to every single launch, including the silent scheduled refresh and
+# the Learn More shortcut); only written to disk if -ExportSource is passed.
+$Script:EmbeddedRepoZipBase64 = $null
+
+if ($ExportSource) {
+    if (-not $Script:EmbeddedRepoZipBase64) {
+        Write-Output "This build has no embedded source (run directly from the .ps1, or built without build.ps1)."
+        exit 1
+    }
+    try {
+        $bytes = [Convert]::FromBase64String($Script:EmbeddedRepoZipBase64)
+        [System.IO.File]::WriteAllBytes($ExportSource, $bytes)
+        Write-Output "Wrote embedded source (repo + git history) to $ExportSource"
+    } catch {
+        Write-Output "Failed to export embedded source: $($_.Exception.Message)"
+        exit 1
+    }
+    exit 0
+}
 
 # ============================================================
 # Spotlight Manager
