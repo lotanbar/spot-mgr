@@ -2,9 +2,8 @@ $src = Join-Path $PSScriptRoot "SpotlightManager.ps1"
 
 # Zip up the tracked repo (source + full git history, via .git) so it can be
 # embedded in the exe and recovered later with -ExportSource. Only meaningful
-# if there's actually a git repo here and it's committed - working tree must
-# be clean, otherwise the embedded snapshot would silently miss your latest
-# edits.
+# if there's actually a git repo here. Uncommitted and untracked working-tree
+# files are included too, so an exported snapshot exactly matches this build.
 function Get-EmbeddedRepoZipBase64 {
     $gitDir = Join-Path $PSScriptRoot ".git"
     if (-not (Test-Path $gitDir)) {
@@ -13,7 +12,7 @@ function Get-EmbeddedRepoZipBase64 {
     }
     $status = git -C $PSScriptRoot status --porcelain
     if ($status) {
-        Write-Warning "Working tree has uncommitted changes - the embedded source snapshot will NOT include them. Commit first if you want them included."
+        Write-Warning "Working tree has uncommitted changes; they will be included in the embedded repository snapshot."
     }
 
     $zipPath = Join-Path $env:TEMP "SpotlightManager-repo-embed.zip"

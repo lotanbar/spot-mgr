@@ -358,69 +358,29 @@ function Format-Interval {
     return ($parts -join " ")
 }
 
-# -----------------------------------------------------------------
-# Builds a self-contained refresh script (no dependency on this exe's
-# file path surviving) and returns it as a base64 -EncodedCommand
-# payload for powershell.exe. The functions are pulled from THIS
-# process's already-loaded definitions (not re-typed/duplicated), so
-# the standalone version can never drift out of sync with the real
-# Get-NewSpotlightImages/Set-DesktopWallpaper/Move-SpotlightImage logic.
-# -----------------------------------------------------------------
-function Get-SilentRefreshEncodedCommand {
-    $neededFunctions = @(
-        "Write-Log", "New-ImageEntry", "Get-State", "Save-State",
-        "Get-NewSpotlightImages", "Set-DesktopWallpaper", "Move-SpotlightImage"
-    )
-
-    $sb = New-Object System.Text.StringBuilder
-    [void]$sb.AppendLine('$ErrorActionPreference = "Stop"')
-    [void]$sb.AppendLine("`$AppDir   = '$AppDir'")
-    [void]$sb.AppendLine("`$CacheDir = '$CacheDir'")
-    [void]$sb.AppendLine("`$StatePath = '$StatePath'")
-    [void]$sb.AppendLine("`$LogPath  = '$LogPath'")
-    [void]$sb.AppendLine("`$ApiBase  = '$ApiBase'")
-    [void]$sb.AppendLine('New-Item -ItemType Directory -Path $CacheDir -Force -ErrorAction SilentlyContinue | Out-Null')
-    [void]$sb.AppendLine(@'
-if (-not ([System.Management.Automation.PSTypeName]'Native.Wallpaper').Type) {
-    Add-Type -Namespace Native -Name Wallpaper -MemberDefinition @"
-[DllImport("user32.dll", CharSet=CharSet.Auto)]
-public static extern int SystemParametersInfo(int uAction, int uParam, string lpvParam, int fuWinIni);
-"@
-}
-'@)
-
-    foreach ($name in $neededFunctions) {
-        $def = (Get-Command $name -CommandType Function).Definition
-        [void]$sb.AppendLine("function $name {$def}")
-    }
-    [void]$sb.AppendLine('Move-SpotlightImage -Direction "Next" | Out-Null')
-
-    $bytes = [System.Text.Encoding]::Unicode.GetBytes($sb.ToString())
-    return [Convert]::ToBase64String($bytes)
-}
-
 # Task Scheduler's repetition trigger rejects any interval under 60 seconds
 # (confirmed: registering with e.g. PT30S throws "value ... out of range"),
 # so anything faster than that cannot go through Register-ScheduledTask at all.
 #
-# The action runs powershell.exe (a core Windows component) with the whole
-# refresh logic passed as -EncodedCommand, instead of pointing at this exe's
-# file path. That means the schedule keeps working in Windows even after
-# this portable exe is deleted or moved - only %LOCALAPPDATA%\SpotlightManager
-# (cache + state, already there regardless) needs to remain.
+# The task launches this no-console exe directly. All application and refresh
+# logic therefore stays in the single exe, and no PowerShell console window
+# can flash when the wallpaper changes.
 function Set-AutoRefreshSchedule {
     param([TimeSpan]$Interval)
 
     try {
-        $psExe = Join-Path $env:windir "System32\WindowsPowerShell\v1.0\powershell.exe"
-        $encoded = Get-SilentRefreshEncodedCommand
+        $exePath = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+        $hostName = [System.IO.Path]::GetFileName($exePath)
+        if ($hostName -in @("powershell.exe", "powershell_ise.exe", "pwsh.exe")) {
+            throw "Auto-refresh can only be enabled from the compiled SpotlightManager.exe."
+        }
         Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue | Out-Null
 
-        $action = New-ScheduledTaskAction -Execute $psExe -Argument "-NoProfile -WindowStyle Hidden -EncodedCommand $encoded"
+        $action = New-ScheduledTaskAction -Execute $exePath -Argument "-Silent -Refresh"
         $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval $Interval -RepetitionDuration (New-TimeSpan -Days 3650)
         $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
-        Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Settings $settings -Description "Rotates the desktop Spotlight image on an interval. Self-contained - does not depend on SpotlightManager.exe still existing." | Out-Null
-        Write-Log "Auto-refresh scheduled every $(Format-Interval $Interval) (self-contained, exe not required to persist)."
+        Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Settings $settings -Description "Rotates the desktop Spotlight image silently using SpotlightManager.exe." | Out-Null
+        Write-Log "Auto-refresh scheduled every $(Format-Interval $Interval) using $exePath."
         return $true
     } catch {
         Write-Log "Failed to create scheduled task: $($_.Exception.Message)"
@@ -450,6 +410,32 @@ function Get-AutoRefreshSchedule {
         # not a TimeSpan object, so it needs explicit parsing.
         return [System.Xml.XmlConvert]::ToTimeSpan($intervalStr)
     } catch { return $null }
+}
+
+function Sync-AutoRefreshScheduleAction {
+    # Upgrade legacy powershell.exe/EncodedCommand tasks, and repair the task
+    # automatically if this portable exe has been moved since it was enabled.
+    try {
+        $interval = Get-AutoRefreshSchedule
+        if (-not $interval) { return $false }
+
+        $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction Stop
+        $action = $task.Actions | Select-Object -First 1
+        $exePath = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+        $correctExe = [string]::Equals($action.Execute, $exePath, [System.StringComparison]::OrdinalIgnoreCase)
+        $correctArguments = ([string]$action.Arguments).Trim() -eq "-Silent -Refresh"
+
+        if (-not $correctExe -or -not $correctArguments) {
+            if (-not (Set-AutoRefreshSchedule -Interval $interval)) {
+                throw "Could not replace the scheduled task action."
+            }
+            Write-Log "Updated auto-refresh task to use the current no-console exe."
+            return $true
+        }
+    } catch {
+        Write-Log "Failed to update auto-refresh task action: $($_.Exception.Message)"
+    }
+    return $false
 }
 
 # -----------------------------------------------------------------
@@ -937,6 +923,9 @@ $chkShortcut.Add_CheckedChanged({
 })
 
 $form.Add_Shown({
+    if (Sync-AutoRefreshScheduleAction) {
+        Append-Log "Updated the existing auto-refresh schedule to run without a console flash."
+    }
     Refresh-ScheduleLabel
     $state = Get-State
     if ($state.Images.Count -gt 0 -and $state.Index -ge 0) {
