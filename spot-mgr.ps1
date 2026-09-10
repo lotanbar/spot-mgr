@@ -7,7 +7,7 @@ param(
 )
 
 # ============================================================
-# Spotlight Manager
+# spot-mgr
 # Fixes Windows Spotlight / Desktop Spotlight getting stuck on
 # the same images, and provides a manual/interval-based image
 # rotation that does not depend on Microsoft's own (unreliable)
@@ -395,12 +395,12 @@ function Set-AutoRefreshSchedule {
         $exePath = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
         $hostName = [System.IO.Path]::GetFileName($exePath)
         if ($hostName -in @("powershell.exe", "powershell_ise.exe", "pwsh.exe")) {
-            throw "Auto-refresh can only be enabled from the compiled SpotlightManager.exe."
+            throw "Auto-refresh can only be enabled from the compiled spot-mgr.exe."
         }
         $action = New-ScheduledTaskAction -Execute $exePath -Argument "-Silent -Refresh"
         $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval $Interval -RepetitionDuration (New-TimeSpan -Days 3650)
         $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable
-        Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Settings $settings -Description "Rotates the desktop Spotlight image silently using SpotlightManager.exe." -Force -ErrorAction Stop | Out-Null
+        Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Settings $settings -Description "Rotates the desktop Spotlight image silently using spot-mgr.exe." -Force -ErrorAction Stop | Out-Null
 
         # A task created while the app is elevated otherwise gives the normal
         # user read-only access, making later interval changes fail. Explicitly
@@ -498,7 +498,7 @@ function Install-ShortcutHelper {
     $exePath = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
     $hostName = [System.IO.Path]::GetFileName($exePath)
     if ($hostName -in @("powershell.exe", "powershell_ise.exe", "pwsh.exe")) {
-        throw "Desktop shortcuts can only be enabled from the compiled SpotlightManager.exe."
+        throw "Desktop shortcuts can only be enabled from the compiled spot-mgr.exe."
     }
 
     # Keep both shortcuts independent from the portable executable. Users can
@@ -661,11 +661,11 @@ if ($OpenLearnMore) {
                 Open-LearnMoreLink -Url $entry.LearnMoreUrl
             } else {
                 Write-Log "Desktop shortcut clicked, but the current image has no info link."
-                [System.Windows.Forms.MessageBox]::Show("No info available for the current image.", "Spotlight Manager") | Out-Null
+                [System.Windows.Forms.MessageBox]::Show("No info available for the current image.", "spot-mgr") | Out-Null
             }
         } else {
             Write-Log "Desktop shortcut clicked, but no image is cached yet."
-            [System.Windows.Forms.MessageBox]::Show("No image has been set yet. Open Spotlight Manager and click 'Next' first.", "Spotlight Manager") | Out-Null
+            [System.Windows.Forms.MessageBox]::Show("No image has been set yet. Open spot-mgr and click 'Next' first.", "spot-mgr") | Out-Null
         }
     } catch {
         Write-Log "OpenLearnMore failed: $($_.Exception.Message)"
@@ -717,7 +717,7 @@ function New-FlatButton {
 $form = New-Object System.Windows.Forms.Form
 $form.AutoScaleDimensions = New-Object System.Drawing.SizeF(96, 96)
 $form.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::Dpi
-$form.Text = "Spotlight Manager"
+$form.Text = "spot-mgr"
 $form.ClientSize = New-Object System.Drawing.Size(1000, 880)
 $form.MinimumSize = New-Object System.Drawing.Size(900, 760)
 $form.StartPosition = "CenterScreen"
@@ -729,7 +729,7 @@ $form.ForeColor = $clrText
 $form.Font = $fontMain
 
 $lblTitle = New-Object System.Windows.Forms.Label
-$lblTitle.Text = "Spotlight Manager"
+$lblTitle.Text = "spot-mgr"
 $lblTitle.Font = $fontTitle
 $lblTitle.ForeColor = $clrText
 $lblTitle.Location = New-Object System.Drawing.Point(16, 10)
